@@ -1,18 +1,26 @@
 """BB-8 + CrowPi2 control panel for kids.
 
-Drive BB-8 with the CrowPi2's joystick; tap big buttons on the touchscreen
-for colors and tricks. Press ESC or Q to quit.
+Drive BB-8 with the CrowPi2's joystick (or the arrow keys / WASD on a laptop);
+tap big buttons on the touchscreen for colors and tricks. Press ESC or Q to quit.
 """
+import argparse
+import math
 import sys
 
 import pygame
 from spherov2.types import Color
 
+import bb8 as bb8_module
 from bb8 import BB8Controller, STATUS_CONNECTED, STATUS_CONNECTING, STATUS_ERROR
 from crowpi_io import CrowPiIO
+from input_sources import CompositeInput, KeyboardInput
 from ui import Button, icon_moon, icon_speaker, icon_star, icon_stop, icon_sun
 
 DRIVE_SPEED = 100
+
+# The CrowPi2's screen. Windowed mode matches it so a laptop preview shows the
+# same layout the kid will actually see.
+CROWPI_SIZE = (1024, 600)
 
 COLORS = [
     ("Red", (220, 40, 40), Color(255, 0, 0)),
@@ -70,10 +78,9 @@ def build_buttons(w, h, font):
     return buttons
 
 
-def draw_direction_indicator(surface, center, radius, heading, font):
+def draw_direction_indicator(surface, center, radius, heading):
     pygame.draw.circle(surface, (50, 50, 65), center, radius, width=6)
     if heading is not None:
-        import math
         angle = math.radians(heading - 90)
         end = (center[0] + radius * math.cos(angle), center[1] + radius * math.sin(angle))
         pygame.draw.line(surface, (60, 200, 255), center, end, 8)
@@ -82,12 +89,28 @@ def draw_direction_indicator(surface, center, radius, heading, font):
         pygame.draw.circle(surface, (90, 90, 100), center, 10)
 
 
-def main():
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description="BB-8 control panel")
+    parser.add_argument(
+        "--fullscreen",
+        action="store_true",
+        help="run fullscreen at native resolution (use this on the CrowPi2)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
     pygame.init()
     pygame.mouse.set_visible(True)
-    info = pygame.display.Info()
-    w, h = info.current_w, info.current_h
-    screen = pygame.display.set_mode((w, h), pygame.FULLSCREEN)
+    if args.fullscreen:
+        info = pygame.display.Info()
+        w, h = info.current_w, info.current_h
+        screen = pygame.display.set_mode((w, h), pygame.FULLSCREEN)
+    else:
+        w, h = CROWPI_SIZE
+        screen = pygame.display.set_mode((w, h))
     pygame.display.set_caption("BB-8 Control Center")
     clock = pygame.time.Clock()
 
@@ -96,6 +119,9 @@ def main():
 
     bb8 = BB8Controller()
     crowpi = CrowPiIO()
+    # Joystick first, keyboard as fallback -- so the same code path works on the
+    # CrowPi2 and on a laptop with no CrowPi hardware attached.
+    direction_input = CompositeInput(crowpi, KeyboardInput())
     buttons = build_buttons(w, h, font)
     retry_rect = pygame.Rect(int(w * 0.85) - 20, int(h * 0.02), int(w * 0.13) + 20, int(h * 0.05))
 
@@ -114,10 +140,11 @@ def main():
                     bb8.connect()
                 for name, button in buttons.items():
                     if button.contains(pos):
+                        button.press()
                         handle_click(name, bb8, crowpi)
 
         if not bb8.busy:
-            heading = crowpi.read_direction()
+            heading = direction_input.read_direction()
             if heading != last_heading:
                 bb8.drive(heading if heading is not None else 0, DRIVE_SPEED if heading is not None else 0)
                 last_heading = heading
@@ -141,17 +168,20 @@ def main():
         status_surf = font.render(status_text, True, (255, 255, 255))
         screen.blit(status_surf, (int(w * 0.87), int(h * 0.035)))
 
+        if not crowpi.joystick_available:
+            hint = font.render("Drive with arrow keys or WASD", True, (140, 140, 160))
+            screen.blit(hint, (int(w * 0.02), int(h * 0.11)))
+
         for button in buttons.values():
             button.draw(screen)
 
-        draw_direction_indicator(
-            screen, (int(w * 0.90), int(h * 0.55)), int(w * 0.06), last_heading, font
-        )
+        draw_direction_indicator(screen, (int(w * 0.90), int(h * 0.55)), int(w * 0.06), last_heading)
 
         pygame.display.flip()
         clock.tick(30)
 
-    bb8.request_stop()
+    crowpi.stop_effects()
+    bb8.shutdown()
     pygame.quit()
 
 
@@ -164,7 +194,7 @@ def handle_click(name, bb8, crowpi):
         bb8.set_color(sphero_color)
     elif name == "pentagon":
         bb8.pentagon()
-        crowpi.play_pentagon_effect()
+        crowpi.play_pentagon_effect(bb8_module.PENTAGON_TOTAL_SECONDS)
     elif name == "noise":
         bb8.noise()
         crowpi.play_noise_effect()
@@ -174,10 +204,11 @@ def handle_click(name, bb8, crowpi):
         bb8.wake_up()
     elif name == "stop":
         bb8.request_stop()
+        crowpi.stop_effects()
 
 
 if __name__ == "__main__":
     try:
-        main()
+        main(sys.argv[1:])
     except KeyboardInterrupt:
         sys.exit(0)

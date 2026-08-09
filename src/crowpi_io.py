@@ -2,9 +2,15 @@
 
 Any hardware that fails to initialize (e.g. running this off the CrowPi2) is
 disabled instead of crashing the app, so the GUI still works for testing.
+
+The LED matrix driver (elecrow_ws281x) ships preinstalled on the CrowPi2 image
+rather than on PyPI, and needs root for PWM/DMA -- see the README. If either is
+missing the matrix simply reports itself unavailable.
 """
 import threading
 import time
+
+from input_sources import DIRECTION_HEADINGS
 
 # Analog joystick, read through the MCP3008 ADC over SPI.
 X_CHANNEL = 1
@@ -16,17 +22,7 @@ BUZZER_PIN = 18
 MATRIX_PIXELS = 64
 MATRIX_BRIGHTNESS = 40
 
-# heading in degrees: 0=forward/up, 90=right, 180=back/down, 270=left
-DIRECTION_HEADINGS = {
-    (True, False, False, False): 0,      # up
-    (True, False, False, True): 45,      # up + right
-    (False, False, False, True): 90,     # right
-    (False, True, False, True): 135,     # down + right
-    (False, True, False, False): 180,    # down
-    (False, True, True, False): 225,     # down + left
-    (False, False, True, False): 270,    # left
-    (True, False, True, False): 315,     # up + left
-}
+MATRIX_FRAME_SECONDS = 0.01
 
 
 class CrowPiIO:
@@ -37,6 +33,8 @@ class CrowPiIO:
         self._spi = None
         self._buzzer = None
         self._matrix = None
+        # Set by stop_effects() so a running light show can be cut short.
+        self._abort = threading.Event()
         self._init_joystick()
         self._init_buzzer()
         self._init_matrix()
@@ -93,38 +91,57 @@ class CrowPiIO:
         if not self.matrix_available:
             return
         self._matrix.fillColor(self._Color(*rgb))
-        time.sleep(duration)
+        self._wait(duration)
 
     def buzz(self, duration=0.15):
         if not self.buzzer_available:
             return
         self._buzzer.on()
-        time.sleep(duration)
+        self._wait(duration)
         self._buzzer.off()
+
+    def _wait(self, duration):
+        """Sleep, returning False immediately if the effect was cancelled."""
+        return not self._abort.wait(duration)
+
+    def stop_effects(self):
+        """Cancel any running light/sound effect. Paired with BB8Controller.request_stop()."""
+        self._abort.set()
 
     def play_noise_effect(self):
         """Sync'd with BB8Controller.noise(): 4 beeps + matrix flashes red/green."""
+        self._abort.clear()
         threading.Thread(target=self._noise_effect_worker, daemon=True).start()
 
     def _noise_effect_worker(self):
         for _ in range(4):
+            if self._abort.is_set():
+                break
             self.matrix_flash((255, 0, 0), 0.15)
             self.buzz(0.15)
             self.matrix_flash((0, 0, 0), 0.15)
-        self.matrix_flash((0, 255, 0), 0.3)
+        if not self._abort.is_set():
+            self.matrix_flash((0, 255, 0), 0.3)
         self.matrix_clear()
 
-    def play_pentagon_effect(self):
+    def play_pentagon_effect(self, duration):
         """Sync'd with BB8Controller.pentagon(): a rainbow chase on the matrix."""
-        threading.Thread(target=self._pentagon_effect_worker, daemon=True).start()
+        self._abort.clear()
+        threading.Thread(target=self._pentagon_effect_worker, args=(duration,), daemon=True).start()
 
-    def _pentagon_effect_worker(self):
+    def _pentagon_effect_worker(self, duration):
         if not self.matrix_available:
             return
-        for j in range(256 * 3):
-            r, g, b = _wheel((j) & 255)
+        # Run for exactly as long as BB-8 is rolling, rather than a fixed frame
+        # count that used to overrun the trick by ~2s and ignore STOP entirely.
+        deadline = time.monotonic() + duration
+        step = 0
+        while time.monotonic() < deadline:
+            r, g, b = _wheel(step & 255)
             self._matrix.fillColor(self._Color(r, g, b))
-            time.sleep(0.01)
+            if not self._wait(MATRIX_FRAME_SECONDS):
+                break
+            step += 1
         self.matrix_clear()
 
 

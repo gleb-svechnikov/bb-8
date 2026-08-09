@@ -1,0 +1,35 @@
+[project]
+name = "bb8-control-center"
+version = "0.1.0"
+description = "Big-button touchscreen GUI for driving a Sphero BB-8 from a CrowPi2"
+requires-python = ">=3.11,<3.12"
+
+dependencies = [
+    # pygame-ce, not pygame: upstream pygame has no wheels past 3.13, and
+    # pygame-ce ships macOS universal2 (M1) plus aarch64 Linux (Raspberry Pi).
+    "pygame-ce>=2.5.6",
+
+    # spherov2 0.12.1 (Jan 2024) is the only library that speaks BB-8's legacy
+    # v1 protocol. It does NOT declare bleak as a dependency, so we pin it here.
+    "spherov2==0.12.1",
+
+    # CRITICAL PIN. spherov2's bleak adapter calls BleakScanner.find_device_by_filter
+    # and write_gatt_char with signatures from the 0.x era. bleak has since released
+    # 1.0, 2.0 and 3.0 with breaking changes to both. Do not relax this bound without
+    # re-testing against a real BB-8.
+    "bleak>=0.21,<1.0",
+
+    # CrowPi2 hardware. Linux-only; on macOS these are simply absent and
+    # crowpi_io.py degrades to "no joystick / no buzzer / no matrix".
+    "gpiozero; sys_platform == 'linux'",
+    "spidev; sys_platform == 'linux'",
+
+    # NOTE: elecrow_ws281x (the 8x8 LED matrix driver) is deliberately NOT listed.
+    # It is not on PyPI -- it ships preinstalled on the CrowPi2 image. See README
+    # for the --system-site-packages step that makes it importable from the venv.
+]
+
+[tool.uv]
+# The CrowPi2's vendor libraries live in the system site-packages, so the venv
+# on the Pi must not be isolated from them.
+package = false
