@@ -1,5 +1,0 @@
-pygame
-spherov2
-bleak
-gpiozero
-spidev
