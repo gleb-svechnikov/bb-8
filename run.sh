@@ -1,7 +1,7 @@
 #!/bin/bash
 # Launches the BB-8 + CrowPi2 control panel.
 #
-#   ./run.sh                 windowed 1024x600 (laptop development)
+#   ./run.sh                 windowed 1920x1000 (laptop development)
 #   ./run.sh --fullscreen    fullscreen at native resolution (CrowPi2)
 #
 # Dependencies are provisioned by uv on first launch, including the correct

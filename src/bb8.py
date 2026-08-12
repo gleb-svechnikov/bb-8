@@ -6,7 +6,7 @@ queue, so the GUI thread never blocks on flaky BLE calls.
 Every command spherov2 sends is a *blocking* BLE round-trip (Sphero.roll ->
 Toy._execute -> _wait_packet), costing roughly 50-100ms. That single fact drives
 the design here: send as few packets as possible, never let a backlog build up,
-and never block the worker thread in a way that STOP can't interrupt.
+and never block the worker thread in a way that shutdown can't interrupt.
 
 Threading note: status/status_detail/connect_attempt/busy are written here on the
 worker thread and read from the UI thread without a lock. Single attribute
@@ -14,15 +14,17 @@ reads are atomic under CPython, and the UI only ever displays them, so this is
 deliberate rather than an oversight -- don't "fix" it with a lock that could
 deadlock against a blocking BLE call.
 """
-import os
 import queue
 import threading
 
 from spherov2 import scanner
-from spherov2.sphero_edu import SpheroEduAPI
+from spherov2.sphero_edu import EventType, SpheroEduAPI
 from spherov2.types import Color
 
-TOY_NAME = os.environ.get("BB8_NAME", "BB-B016")
+import bluetooth_power
+from config import load_toy_name
+
+TOY_NAME = load_toy_name()
 CONNECT_ATTEMPTS = 10
 CONNECT_RETRY_DELAY = 1.5
 
@@ -32,18 +34,13 @@ STATUS_CONNECTED = "connected"
 STATUS_ERROR = "error"
 
 READY_COLOR = Color(0, 255, 0)
-SLEEP_COLOR = Color(0, 0, 0)
 
 PENTAGON_SPEED = 70
 PENTAGON_SIDE_SECONDS = 1.2
-SPIN_STEP_DEGREES = 45
-SPIN_STEP_SECONDS = 0.06
-SPIN_REVOLUTIONS = 4
 
-# How long each trick runs. The CrowPi2 light show is timed by hand against BB-8's
-# motion, so it reads these rather than duplicating the numbers.
+# How long the trick runs. The CrowPi2 light show is timed by hand against BB-8's
+# motion, so it reads this rather than duplicating the number.
 PENTAGON_TOTAL_SECONDS = 5 * PENTAGON_SIDE_SECONDS
-NOISE_TOTAL_SECONDS = SPIN_REVOLUTIONS * (360 // SPIN_STEP_DEGREES) * SPIN_STEP_SECONDS
 
 
 class BB8Controller:
@@ -51,14 +48,18 @@ class BB8Controller:
         self.toy_name = toy_name
         self.status = STATUS_DISCONNECTED
         self.status_detail = ""
+        self.address = ""
         self.connect_attempt = 0
         self.busy = False
         self._toy = None
         self._api = None
         self._queue = queue.Queue()
-        # _abort cancels an in-flight trick (the STOP button). _shutdown is a
-        # separate signal for "we're quitting" -- STOP must not kill a connection
-        # attempt, but quitting must not wait out ten retries either.
+        # Collision notifications arrive on a thread spherov2 spawns per event, not
+        # the worker thread -- a Queue is the cheap thread-safe hand-off to the UI.
+        self._collisions = queue.Queue()
+        # _abort cancels an in-flight trick. _shutdown is a separate signal for
+        # "we're quitting" -- an abort must not kill a connection attempt, but
+        # quitting must not wait out ten retries either.
         self._abort = threading.Event()
         self._shutdown = threading.Event()
         self._done = threading.Event()
@@ -84,18 +85,56 @@ class BB8Controller:
     def pentagon(self):
         self._queue.put(("pentagon", None))
 
-    def noise(self):
-        self._queue.put(("noise", None))
+    def get_location(self):
+        """(x, y) in cm from where BB-8 connected, or None with no fix yet.
 
-    def go_to_sleep(self):
-        self._queue.put(("sleep", None))
+        Reads spherov2's already-streamed sensor cache directly rather than
+        going through the command queue -- it's just a dict lookup, and
+        SpheroEduAPI documents itself as thread-safe for this.
+        """
+        api = self._api
+        if not api:
+            return None
+        try:
+            loc = api.get_location()
+        except Exception:
+            return None
+        return (loc["x"], loc["y"]) if loc else None
 
-    def wake_up(self):
-        self._queue.put(("wake", None))
+    def get_sensors(self):
+        """Snapshot of live sensor readings for the left-panel readout.
 
-    def request_stop(self):
-        self._abort.set()
-        self._queue.put(("stop", None))
+        Values are None with no API connected or no fix streamed yet, same
+        deal as get_location() -- a dict lookup against spherov2's cache.
+        """
+        empty = dict.fromkeys(
+            ("location", "velocity", "speed", "heading", "orientation", "acceleration", "gyroscope")
+        )
+        api = self._api
+        if not api:
+            return empty
+        try:
+            return {
+                "location": api.get_location(),
+                "velocity": api.get_velocity(),
+                "speed": api.get_speed(),
+                "heading": api.get_heading(),
+                "orientation": api.get_orientation(),
+                "acceleration": api.get_acceleration(),
+                "gyroscope": api.get_gyroscope(),
+            }
+        except Exception:
+            return empty
+
+    def poll_collisions(self):
+        """Drain and return (x, y) locations of bumps detected since the last call."""
+        hits = []
+        while True:
+            try:
+                hits.append(self._collisions.get_nowait())
+            except queue.Empty:
+                break
+        return hits
 
     def shutdown(self, timeout=3.0):
         """Disconnect cleanly. Blocks briefly so BLE tears down before we exit."""
@@ -143,6 +182,13 @@ class BB8Controller:
                 handler = getattr(self, f"_handle_{action}")
                 handler(payload)
             except Exception as e:
+                # Don't tear down self._api here: a transient BLE hiccup during a
+                # single drive/color/pentagon packet is common (see module
+                # docstring) and often recoverable on the *next* packet without a
+                # full reconnect. Killing the link on every such blip would make
+                # driving stop dead after the first dropped packet. The link only
+                # gets torn down for real in _handle_connect(), right before a
+                # fresh reconnect actually replaces it.
                 self.status, self.status_detail = STATUS_ERROR, str(e)
                 self.busy = False
 
@@ -157,32 +203,60 @@ class BB8Controller:
         finally:
             self._api = self._toy = None
             self.status = STATUS_DISCONNECTED
+            self.address = ""
             self._done.set()
 
     def _sleep_interruptible(self, duration):
-        """Wait, returning False immediately if STOP was pressed."""
+        """Wait, returning False immediately if an abort/shutdown was requested."""
         return not self._abort.wait(duration)
+
+    def _on_collision(self, _api):
+        """Called by spherov2 on its own event thread whenever BB-8 bumps something.
+
+        spherov2 always passes the SpheroEduAPI instance as the first arg to
+        event listeners (see __call_event_listener's args=(self, *args)) --
+        drop the positional-arg count mismatch here and this never fires.
+        """
+        location = self.get_location()
+        if location:
+            self._collisions.put(location)
 
     def _forget_sent_state(self):
         """Called whenever the toy's motion state changed behind our back."""
         self._sent_heading = self._sent_speed = None
 
     def _handle_connect(self, _payload):
+        # If a previous connection is still around (e.g. the user pressed R to
+        # force a reconnect after a BLE error), close it out first -- otherwise
+        # its bleak client is orphaned rather than disconnected, which on Linux
+        # BlueZ can keep BB-8 from re-advertising and make the scan below time out.
+        try:
+            if self._api:
+                self._api.__exit__(None, None, None)
+        except Exception:
+            pass
+        self._api = self._toy = None
+
         self.status, self.connect_attempt = STATUS_CONNECTING, 0
+        self.address = ""
+        bluetooth_power.ensure_bluetooth_on()
         for attempt in range(1, CONNECT_ATTEMPTS + 1):
             if self._shutdown.is_set():
                 return  # quitting mid-retry; don't make the user wait it out
             self.connect_attempt = attempt
             try:
                 toy = scanner.find_toy(toy_name=self.toy_name)
+                self.address = getattr(toy, "address", "") or ""
                 api = SpheroEduAPI(toy)
                 api.__enter__()
                 self._toy, self._api = toy, api
                 self._forget_sent_state()
                 self._api.set_main_led(READY_COLOR)
+                self._api.register_event(EventType.on_collision, self._on_collision)
                 self.status, self.status_detail = STATUS_CONNECTED, ""
                 return
             except Exception as e:
+                self.address = ""
                 self.status_detail = str(e) or "timed out"
                 self._shutdown.wait(CONNECT_RETRY_DELAY)
         self.status = STATUS_ERROR
@@ -206,22 +280,6 @@ class BB8Controller:
             self._api.set_speed(speed)
             self._sent_speed = speed
 
-    def _handle_stop(self, _payload):
-        if self._api:
-            self._api.stop_roll()
-            self._sent_speed = 0
-
-    def _handle_sleep(self, _payload):
-        if not self._api:
-            return
-        self._api.stop_roll()
-        self._sent_speed = 0
-        self._api.set_main_led(SLEEP_COLOR)
-
-    def _handle_wake(self, _payload):
-        if self._api:
-            self._api.set_main_led(READY_COLOR)
-
     def _handle_pentagon(self, _payload):
         if not self._api:
             return
@@ -239,29 +297,6 @@ class BB8Controller:
                     break
                 heading = (heading + 72) % 360
             self._api.stop_roll()
-            if self.status == STATUS_CONNECTED:
-                self._api.set_main_led(READY_COLOR)
-        finally:
-            self._forget_sent_state()
-            self.busy = False
-
-    def _handle_noise(self, _payload):
-        if not self._api:
-            return
-        self._abort.clear()
-        self.busy = True
-        try:
-            self._api.set_main_led(Color(255, 0, 0))
-            # Hand-rolled spin instead of spherov2's spin(): that one busy-loops a
-            # blocking round-trip per step with no way to bail out, which is what
-            # made STOP feel dead for seconds while NOISE was playing.
-            self._api.set_speed(0)
-            heading = 0
-            for _ in range(SPIN_REVOLUTIONS * (360 // SPIN_STEP_DEGREES)):
-                heading = (heading + SPIN_STEP_DEGREES) % 360
-                self._api.set_heading(heading)
-                if not self._sleep_interruptible(SPIN_STEP_SECONDS):
-                    break
             if self.status == STATUS_CONNECTED:
                 self._api.set_main_led(READY_COLOR)
         finally:

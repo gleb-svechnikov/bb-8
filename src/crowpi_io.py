@@ -1,4 +1,4 @@
-"""Wraps the CrowPi2's onboard joystick, buzzer and 8x8 LED matrix.
+"""Wraps the CrowPi2's onboard joystick and 8x8 LED matrix.
 
 Any hardware that fails to initialize (e.g. running this off the CrowPi2) is
 disabled instead of crashing the app, so the GUI still works for testing.
@@ -18,7 +18,6 @@ Y_CHANNEL = 0
 LOW_THRESHOLD = 400
 HIGH_THRESHOLD = 650
 
-BUZZER_PIN = 18
 MATRIX_PIXELS = 64
 MATRIX_BRIGHTNESS = 40
 
@@ -28,15 +27,12 @@ MATRIX_FRAME_SECONDS = 0.01
 class CrowPiIO:
     def __init__(self):
         self.joystick_available = False
-        self.buzzer_available = False
         self.matrix_available = False
         self._spi = None
-        self._buzzer = None
         self._matrix = None
         # Set by stop_effects() so a running light show can be cut short.
         self._abort = threading.Event()
         self._init_joystick()
-        self._init_buzzer()
         self._init_matrix()
 
     def _init_joystick(self):
@@ -48,14 +44,6 @@ class CrowPiIO:
             self.joystick_available = True
         except Exception:
             self.joystick_available = False
-
-    def _init_buzzer(self):
-        try:
-            from gpiozero import Buzzer
-            self._buzzer = Buzzer(BUZZER_PIN)
-            self.buzzer_available = True
-        except Exception:
-            self.buzzer_available = False
 
     def _init_matrix(self):
         try:
@@ -93,36 +81,13 @@ class CrowPiIO:
         self._matrix.fillColor(self._Color(*rgb))
         self._wait(duration)
 
-    def buzz(self, duration=0.15):
-        if not self.buzzer_available:
-            return
-        self._buzzer.on()
-        self._wait(duration)
-        self._buzzer.off()
-
     def _wait(self, duration):
         """Sleep, returning False immediately if the effect was cancelled."""
         return not self._abort.wait(duration)
 
     def stop_effects(self):
-        """Cancel any running light/sound effect. Paired with BB8Controller.request_stop()."""
+        """Cancel any running light/sound effect (e.g. on app shutdown)."""
         self._abort.set()
-
-    def play_noise_effect(self):
-        """Sync'd with BB8Controller.noise(): 4 beeps + matrix flashes red/green."""
-        self._abort.clear()
-        threading.Thread(target=self._noise_effect_worker, daemon=True).start()
-
-    def _noise_effect_worker(self):
-        for _ in range(4):
-            if self._abort.is_set():
-                break
-            self.matrix_flash((255, 0, 0), 0.15)
-            self.buzz(0.15)
-            self.matrix_flash((0, 0, 0), 0.15)
-        if not self._abort.is_set():
-            self.matrix_flash((0, 255, 0), 0.3)
-        self.matrix_clear()
 
     def play_pentagon_effect(self, duration):
         """Sync'd with BB8Controller.pentagon(): a rainbow chase on the matrix."""
